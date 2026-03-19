@@ -28,6 +28,7 @@ INVESTING_WTI_PAIR_ID = 8849
 INVESTING_WTI_PAGE_URL = "https://www.investing.com/commodities/crude-oil"
 INVESTING_WTI_ADVANCED_CHART_URL = "https://www.investing.com/commodities/crude-oil-advanced-chart"
 INVESTING_WTI_HISTORY_URL = "https://advcharts.investing.com/advinion2016/advanced-charts/1/1/8/GetHistoryByDates"
+YAHOO_FRONT_MONTH_SYMBOL = "CL=F"
 
 
 @dataclass
@@ -120,6 +121,7 @@ def fetch_history(symbol: str, interval: str = "1d", period_range: str = "6mo") 
 def fetch_investing_wti_quote() -> WTIQuote:
     url = INVESTING_WTI_PAGE_URL
     scraper = create_investing_scraper()
+    warm_investing_session(scraper)
     response = scraper.get(
         url,
         timeout=20,
@@ -152,7 +154,7 @@ def fetch_investing_wti_quote() -> WTIQuote:
     if not previous_close_float and change:
         previous_close_float = price_float - parse_number(change)
 
-    return WTIQuote(
+    quote = WTIQuote(
         symbol="WTI",
         contract_name="Crude Oil WTI Futures",
         price=price_float,
@@ -164,6 +166,9 @@ def fetch_investing_wti_quote() -> WTIQuote:
         source_label="Investing.com",
         page_url=url,
     )
+    if quote.price <= 0:
+        return fetch_investing_quote_from_history()
+    return quote
 
 
 def fetch_investing_quote_from_history() -> WTIQuote:
@@ -193,6 +198,7 @@ def fetch_investing_quote_from_history() -> WTIQuote:
 
 def fetch_investing_history(timeframe: str, days_back: int) -> List[PriceBar]:
     scraper = create_investing_scraper()
+    warm_investing_session(scraper)
     end = datetime.utcnow().replace(microsecond=0)
     start = end - timedelta(days=days_back)
     params = {
@@ -207,8 +213,16 @@ def fetch_investing_history(timeframe: str, days_back: int) -> List[PriceBar]:
         INVESTING_WTI_HISTORY_URL,
         params=params,
         timeout=20,
-        headers={"Referer": INVESTING_WTI_ADVANCED_CHART_URL},
+        headers={
+            "Referer": INVESTING_WTI_ADVANCED_CHART_URL,
+            "Origin": "https://www.investing.com",
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
     )
+    if response.status_code == 403:
+        return fetch_yahoo_history_for_wti(timeframe, days_back)
     response.raise_for_status()
     payload = response.json()
     bars: List[PriceBar] = []
@@ -270,6 +284,34 @@ def fetch_yahoo_quote(symbol: str) -> WTIQuote:
     )
 
 
+def fetch_yahoo_front_month_quote() -> WTIQuote:
+    quote = fetch_yahoo_quote(YAHOO_FRONT_MONTH_SYMBOL)
+    quote.symbol = "WTI"
+    quote.source_label = "Yahoo Finance fallback"
+    return quote
+
+
+def fetch_yahoo_history_for_wti(timeframe: str, days_back: int) -> List[PriceBar]:
+    interval_map = {
+        "5M": "5m",
+        "15M": "15m",
+        "30M": "30m",
+        "60M": "60m",
+        "1H": "60m",
+        "1D": "1d",
+    }
+    range_map = {
+        1: "1d",
+        5: "5d",
+        30: "1mo",
+        90: "3mo",
+        180: "6mo",
+    }
+    interval = interval_map.get(timeframe.upper(), "5m")
+    period_range = range_map.get(days_back, "5d")
+    return fetch_history(YAHOO_FRONT_MONTH_SYMBOL, interval=interval, period_range=period_range)
+
+
 def extract_value(text: str, pattern: str, flags: int = 0) -> str:
     match = re.search(pattern, text, flags=flags)
     return match.group(1).strip() if match else ""
@@ -282,3 +324,15 @@ def parse_number(text: str) -> float:
 
 def create_investing_scraper() -> cloudscraper.CloudScraper:
     return cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "mobile": False})
+
+
+def warm_investing_session(scraper: cloudscraper.CloudScraper) -> None:
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    for url in (INVESTING_WTI_PAGE_URL, INVESTING_WTI_ADVANCED_CHART_URL):
+        try:
+            scraper.get(url, timeout=20, headers=headers)
+        except requests.RequestException:
+            continue
