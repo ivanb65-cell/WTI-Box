@@ -1,0 +1,17 @@
+[Unit]
+Description=Oil Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/opt/oil-telegram-bot
+EnvironmentFile=/opt/oil-telegram-bot/.env
+Environment=STATE_FILE=/opt/oil-telegram-bot/data/state.json
+ExecStart=/opt/oil-telegram-bot/.venv/bin/python /opt/oil-telegram-bot/bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
