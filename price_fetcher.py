@@ -119,7 +119,18 @@ def fetch_history(symbol: str, interval: str = "1d", period_range: str = "6mo") 
 
 def fetch_investing_wti_quote() -> WTIQuote:
     url = INVESTING_WTI_PAGE_URL
-    response = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+    scraper = create_investing_scraper()
+    response = scraper.get(
+        url,
+        timeout=20,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://www.investing.com/",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    )
+    if response.status_code == 403:
+        return fetch_investing_quote_from_history()
     response.raise_for_status()
     html = response.text
 
@@ -152,6 +163,31 @@ def fetch_investing_wti_quote() -> WTIQuote:
         as_of_unix=as_of_unix,
         source_label="Investing.com",
         page_url=url,
+    )
+
+
+def fetch_investing_quote_from_history() -> WTIQuote:
+    bars = fetch_investing_history("5M", 1)
+    if not bars:
+        raise RuntimeError("Could not fetch WTI quote from Investing.com history.")
+
+    latest = bars[-1]
+    previous_close = bars[-2].close if len(bars) > 1 else latest.open
+    day_high = max(bar.high for bar in bars)
+    day_low = min(bar.low for bar in bars)
+    total_volume = sum(bar.volume for bar in bars)
+
+    return WTIQuote(
+        symbol="WTI",
+        contract_name="Crude Oil WTI Futures",
+        price=latest.close,
+        previous_close=previous_close,
+        day_high=day_high,
+        day_low=day_low,
+        volume=total_volume,
+        as_of_unix=latest.timestamp,
+        source_label="Investing.com",
+        page_url=INVESTING_WTI_ADVANCED_CHART_URL,
     )
 
 
