@@ -6,6 +6,7 @@ import os
 from typing import List, Tuple
 
 from dotenv import load_dotenv
+from eia_fetcher import EIAOilSnapshot, fetch_eia_oil_snapshot
 from price_fetcher import WTIQuote, fetch_investing_history, fetch_investing_wti_quote
 from telegram import Update
 from telegram.constants import ParseMode
@@ -16,7 +17,16 @@ from telegram.ext import (
 )
 
 from news_fetcher import fetch_headlines
-from scoring import AnalysisResult, TradePlan, analyze_text, build_trade_plan, merge_analyses
+from scoring import (
+    AnalysisResult,
+    EIAOilInputs,
+    TradePlan,
+    analyze_eia_data,
+    analyze_text,
+    build_trade_plan,
+    merge_analysis_results,
+    merge_analyses,
+)
 from state_store import (
     cleanup_old_sent,
     get_chat_config,
@@ -37,6 +47,7 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "300"))
 ALLOWED_CHAT_IDS = {x.strip() for x in os.getenv("ALLOWED_CHAT_IDS", "").split(",") if x.strip()}
 DEDUPE_WINDOW_MINUTES = int(os.getenv("DEDUPE_WINDOW_MINUTES", "240"))
+MAX_PRICE_DISTANCE_PCT = 0.03
 
 
 def is_allowed(chat_id: int) -> bool:
@@ -143,8 +154,8 @@ async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("I couldn't fetch the active WTI futures price right now. Please try again shortly.")
         return
 
-    headline_bias = build_live_headline_bias()
-    text = format_price_response(quote=quote, headline_bias=headline_bias)
+    headline_bias, eia_snapshot = build_live_fundamental_bias()
+    text = format_price_response(quote=quote, headline_bias=headline_bias, eia_snapshot=eia_snapshot)
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
 
 
@@ -163,10 +174,16 @@ async def strategy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("I couldn't get enough intraday chart history to build the swing and scalp strategies right now.")
         return
 
-    headline_bias = build_live_headline_bias()
+    headline_bias, eia_snapshot = build_live_fundamental_bias()
     swing_strategy = analyze_strategy(quote=quote, bars=swing_bars, fundamental_bias=headline_bias, style="swing")
     scalp_strategy = analyze_strategy(quote=quote, bars=scalp_bars, fundamental_bias=headline_bias, style="scalp")
-    text = format_strategy_suite_response(quote=quote, headline_bias=headline_bias, swing_strategy=swing_strategy, scalp_strategy=scalp_strategy)
+    text = format_strategy_suite_response(
+        quote=quote,
+        headline_bias=headline_bias,
+        swing_strategy=swing_strategy,
+        scalp_strategy=scalp_strategy,
+        eia_snapshot=eia_snapshot,
+    )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
 
 
@@ -193,9 +210,9 @@ async def run_single_style_strategy(update: Update, style: str, interval: str, p
         await update.message.reply_text("I couldn't get enough intraday chart history to build that strategy right now.")
         return
 
-    headline_bias = build_live_headline_bias()
+    headline_bias, eia_snapshot = build_live_fundamental_bias()
     strategy = analyze_strategy(quote=quote, bars=bars, fundamental_bias=headline_bias, style=style)
-    text = format_single_strategy_response(quote=quote, headline_bias=headline_bias, strategy=strategy)
+    text = format_single_strategy_response(quote=quote, headline_bias=headline_bias, strategy=strategy, eia_snapshot=eia_snapshot)
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
 
 
@@ -207,12 +224,14 @@ async def now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg = get_chat_config(state, chat_id)
     items = await asyncio.to_thread(fetch_headlines)
     live_quote = await asyncio.to_thread(safe_fetch_live_quote)
+    eia_snapshot = await asyncio.to_thread(safe_fetch_eia_oil_snapshot)
     alerts = build_alerts_for_chat(
         chat_id=chat_id,
         threshold=cfg["threshold"],
         state=state,
         items=items,
         live_quote=live_quote,
+        eia_snapshot=eia_snapshot,
     )
     save_state(state)
     if not alerts:
@@ -246,6 +265,7 @@ async def testalert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         summary="Supply is tightening while geopolitical risk supports a higher oil risk premium.",
         trade_plan=build_trade_plan(reference_price=sample_quote.price, bias="Bullish", confidence=8),
         live_quote=sample_quote,
+        eia_snapshot=None,
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
 
@@ -255,6 +275,7 @@ async def scheduled_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
     cleanup_old_sent(state, DEDUPE_WINDOW_MINUTES)
     items = await asyncio.to_thread(fetch_headlines)
     live_quote = await asyncio.to_thread(safe_fetch_live_quote)
+    eia_snapshot = await asyncio.to_thread(safe_fetch_eia_oil_snapshot)
     subscriptions = state.get("subscriptions", {})
     for chat_id_str, cfg in subscriptions.items():
         if not cfg.get("enabled"):
@@ -269,6 +290,7 @@ async def scheduled_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
                 state=state,
                 items=items,
                 live_quote=live_quote,
+                eia_snapshot=eia_snapshot,
             )
             for text in alerts[:5]:
                 await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
@@ -283,15 +305,20 @@ def build_alerts_for_chat(
     state: dict,
     items: List[dict] | None = None,
     live_quote: WTIQuote | None = None,
+    eia_snapshot: EIAOilSnapshot | None = None,
 ) -> List[str]:
     items = items if items is not None else fetch_headlines()
     live_quote = live_quote if live_quote is not None else safe_fetch_live_quote()
+    eia_snapshot = eia_snapshot if eia_snapshot is not None else safe_fetch_eia_oil_snapshot()
+    eia_result = analyze_eia_snapshot(eia_snapshot) if eia_snapshot else None
     qualifying: List[Tuple[dict, AnalysisResult]] = []
     for item in items:
         if was_recently_sent(state, chat_id, item["id"], DEDUPE_WINDOW_MINUTES):
             continue
         combined = f"{item['title']} {item['summary']}"
         result = analyze_text(combined)
+        if eia_result:
+            result = merge_analysis_results([result, eia_result])
         if result.confidence >= threshold and result.bias != "Neutral":
             qualifying.append((item, result))
 
@@ -308,6 +335,7 @@ def build_alerts_for_chat(
                 summary=result.summary,
                 trade_plan=build_trade_plan(reference_price=live_quote.price, bias=result.bias, confidence=result.confidence) if live_quote else None,
                 live_quote=live_quote,
+                eia_snapshot=eia_snapshot,
             )
         )
         mark_sent(state, chat_id, item["id"])
@@ -323,6 +351,7 @@ def format_alert(
     summary: str,
     trade_plan: TradePlan | None,
     live_quote: WTIQuote | None,
+    eia_snapshot: EIAOilSnapshot | None,
 ) -> str:
     signal_badge = "[BUY]" if bias == "Bullish" else "[SELL]" if bias == "Bearish" else "[HOLD]"
     lines = [
@@ -331,6 +360,8 @@ def format_alert(
     ]
     if live_quote:
         lines.extend(format_live_quote_snapshot(live_quote))
+    if eia_snapshot:
+        lines.extend(format_eia_snapshot(eia_snapshot))
     lines.append("*Key Drivers:*")
     for d in drivers[:5]:
         lines.append(f"- {escape_markdown(d)}")
@@ -373,11 +404,27 @@ def build_live_headline_bias(max_items: int = 10) -> AnalysisResult:
     return merge_analyses(analyses)
 
 
+def build_live_fundamental_bias(max_items: int = 10) -> Tuple[AnalysisResult, EIAOilSnapshot | None]:
+    headline_bias = build_live_headline_bias(max_items=max_items)
+    eia_snapshot = safe_fetch_eia_oil_snapshot()
+    if not eia_snapshot:
+        return headline_bias, None
+    return merge_analysis_results([headline_bias, analyze_eia_snapshot(eia_snapshot)]), eia_snapshot
+
+
 def safe_fetch_live_quote() -> WTIQuote | None:
     try:
         return fetch_investing_wti_quote()
     except Exception as exc:
         logger.warning("Failed to fetch live WTI quote for alerts: %s", exc)
+        return None
+
+
+def safe_fetch_eia_oil_snapshot() -> EIAOilSnapshot | None:
+    try:
+        return fetch_eia_oil_snapshot()
+    except Exception as exc:
+        logger.warning("Failed to fetch EIA weekly oil data: %s", exc)
         return None
 
 
@@ -395,7 +442,7 @@ def fetch_multi_strategy_inputs() -> Tuple[WTIQuote, list, list]:
     return live_quote, swing_bars, scalp_bars
 
 
-def format_price_response(quote: WTIQuote, headline_bias: AnalysisResult) -> str:
+def format_price_response(quote: WTIQuote, headline_bias: AnalysisResult, eia_snapshot: EIAOilSnapshot | None) -> str:
     long_setup = build_breakout_setup(quote.price, quote.day_high, "Bullish")
     short_setup = build_breakout_setup(quote.price, quote.day_low, "Bearish")
     preferred = headline_bias.bias.upper() if headline_bias.bias != "Neutral" else "MIXED"
@@ -413,9 +460,11 @@ def format_price_response(quote: WTIQuote, headline_bias: AnalysisResult) -> str
         f"- As of: {escape_markdown(quote.as_of_utc)}",
         direction_line,
         f"- Drivers: {escape_markdown(', '.join(headline_bias.key_drivers[:3]) or 'No strong drivers')}",
-        "",
-        "*Suggested BUY Setup:*",
     ]
+    if eia_snapshot:
+        lines.extend(format_eia_snapshot(eia_snapshot))
+    lines.append("")
+    lines.append("*Suggested BUY Setup:*")
     lines.extend(format_trade_plan(long_setup))
     lines.append("")
     lines.append("*Suggested SELL Setup:*")
@@ -423,8 +472,13 @@ def format_price_response(quote: WTIQuote, headline_bias: AnalysisResult) -> str
     return "\n".join(lines)
 
 
-def format_single_strategy_response(quote: WTIQuote, headline_bias: AnalysisResult, strategy: StrategyAnalysis) -> str:
-    lines = strategy_header_lines(quote, headline_bias)
+def format_single_strategy_response(
+    quote: WTIQuote,
+    headline_bias: AnalysisResult,
+    strategy: StrategyAnalysis,
+    eia_snapshot: EIAOilSnapshot | None,
+) -> str:
+    lines = strategy_header_lines(quote, headline_bias, eia_snapshot)
     lines.append("")
     lines.extend(format_strategy_section(strategy))
     return "\n".join(lines)
@@ -435,8 +489,9 @@ def format_strategy_suite_response(
     headline_bias: AnalysisResult,
     swing_strategy: StrategyAnalysis,
     scalp_strategy: StrategyAnalysis,
+    eia_snapshot: EIAOilSnapshot | None,
 ) -> str:
-    lines = strategy_header_lines(quote, headline_bias)
+    lines = strategy_header_lines(quote, headline_bias, eia_snapshot)
     lines.append("")
     lines.extend(format_strategy_section(swing_strategy))
     lines.append("")
@@ -444,8 +499,8 @@ def format_strategy_suite_response(
     return "\n".join(lines)
 
 
-def strategy_header_lines(quote: WTIQuote, headline_bias: AnalysisResult) -> List[str]:
-    return [
+def strategy_header_lines(quote: WTIQuote, headline_bias: AnalysisResult, eia_snapshot: EIAOilSnapshot | None) -> List[str]:
+    lines = [
         "*WTI Intraday Strategy Desk*",
         f"- Contract: {escape_markdown(quote.contract_name)}",
         f"- Symbol: {escape_markdown(quote.symbol)}",
@@ -458,6 +513,35 @@ def strategy_header_lines(quote: WTIQuote, headline_bias: AnalysisResult) -> Lis
         f"- Headline bias: {headline_bias.bias} ({headline_bias.confidence}/10)",
         f"- Drivers: {escape_markdown(', '.join(headline_bias.key_drivers[:3]) or 'No strong drivers')}",
     ]
+    if eia_snapshot:
+        lines.extend(format_eia_snapshot(eia_snapshot))
+    return lines
+
+
+def format_eia_snapshot(snapshot: EIAOilSnapshot) -> List[str]:
+    return [
+        f"*EIA Week:* {escape_markdown(snapshot.week_ending)} | *Release:* {escape_markdown(snapshot.release_date)}",
+        (
+            f"*EIA Oil Data:* Crude {snapshot.commercial_crude.difference:+.2f} mb, "
+            f"Cushing {snapshot.cushing.difference:+.2f} mb, "
+            f"Gasoline {snapshot.gasoline.difference:+.2f} mb, "
+            f"Distillate {snapshot.distillate.difference:+.2f} mb"
+        ),
+    ]
+
+
+def analyze_eia_snapshot(snapshot: EIAOilSnapshot) -> AnalysisResult:
+    return analyze_eia_data(
+        EIAOilInputs(
+            commercial_crude_change=snapshot.commercial_crude.difference,
+            cushing_change=snapshot.cushing.difference,
+            gasoline_change=snapshot.gasoline.difference,
+            distillate_change=snapshot.distillate.difference,
+            propane_change=snapshot.propane.difference,
+            week_ending=snapshot.week_ending,
+            release_date=snapshot.release_date,
+        )
+    )
 
 
 def format_strategy_section(strategy: StrategyAnalysis) -> List[str]:
@@ -485,16 +569,21 @@ def format_strategy_section(strategy: StrategyAnalysis) -> List[str]:
 
 
 def build_breakout_setup(reference_price: float, trigger_anchor: float, bias: str) -> TradePlan:
-    entry_buffer = round(max(0.12, reference_price * 0.0018), 2)
-    risk = round(max(0.45, reference_price * 0.006), 2)
+    max_band = round(reference_price * MAX_PRICE_DISTANCE_PCT, 2)
+    entry_buffer = round(min(max(0.12, reference_price * 0.0018), max_band * 0.2), 2)
+    risk = round(max(0.3, min(max(0.45, reference_price * 0.006), max_band * 0.3)), 2)
     if bias == "Bullish":
-        entry = round(max(reference_price, trigger_anchor) + entry_buffer, 2)
+        entry_cap = round(reference_price + max_band * 0.2, 2)
+        entry = round(min(max(reference_price, trigger_anchor) + entry_buffer, entry_cap), 2)
+        risk = round(min(risk, max(0.2, (reference_price * (1 + MAX_PRICE_DISTANCE_PCT) - entry) / 2.4 * 0.98)), 2)
         stop = round(entry - risk, 2)
         tp1 = round(entry + risk * 1.5, 2)
         tp2 = round(entry + risk * 2.4, 2)
         signal = "BUY"
     else:
-        entry = round(min(reference_price, trigger_anchor) - entry_buffer, 2)
+        entry_floor = round(reference_price - max_band * 0.2, 2)
+        entry = round(max(min(reference_price, trigger_anchor) - entry_buffer, entry_floor), 2)
+        risk = round(min(risk, max(0.2, (entry - reference_price * (1 - MAX_PRICE_DISTANCE_PCT)) / 2.4 * 0.98)), 2)
         stop = round(entry + risk, 2)
         tp1 = round(entry - risk * 1.5, 2)
         tp2 = round(entry - risk * 2.4, 2)
